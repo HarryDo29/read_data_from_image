@@ -37,7 +37,11 @@ class OCRLine:
 TIME_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}:\d{2})(?!\d)")
 DATE_RE = re.compile(r"(?<!\d)(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4})(?!\d)")
 ID_RE = re.compile(r"(?<!\d)((?:\d[ \t]*){15,22})(?!\d)")
-MONEY_RE = re.compile(r"(?<![\d:])(-?(?:\d+)?[.,]\d{1,4})(?!\d)")
+SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})(?!\d)")
+TRANSACTION_ID_RE = re.compile(r"(?<!\d)(\d{8,14})(?!\d)")
+MONEY_RE = re.compile(
+    r"(?<![\d:])(-?\s*(?:[$€₫]\s*)?(?:\d+)?[.,]\d{1,4})(?!\d)"
+)
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DATABASE_PATH = DATA_DIR / "records.sqlite3"
 
@@ -119,7 +123,7 @@ def extract_ticket_id(text: str) -> str | None:
 def extract_money(text: str) -> list[float]:
     values: list[float] = []
     for match in MONEY_RE.finditer(text):
-        normalized = match.group(1).replace(",", ".")
+        normalized = re.sub(r"[^\d,.-]", "", match.group(1)).replace(",", ".")
         if normalized.startswith("."):
             normalized = "0" + normalized
         elif normalized.startswith("-."):
@@ -131,7 +135,7 @@ def extract_money(text: str) -> list[float]:
     return values
 
 
-def parse_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
+def parse_sc8882_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
     time_anchors = [
         (line, match.group(1))
         for line in lines
@@ -231,6 +235,7 @@ def parse_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
         )
 
         record = {
+            "source_type": "sc8882",
             "datetime": date_time,
             "game": game or "",
             "bet_amount": stake_values[0][1] if stake_values else None,
@@ -257,6 +262,118 @@ def parse_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
     return records
 
 
+def detect_source_type(lines: list[OCRLine]) -> str:
+    """Classify the screenshot layout before extracting its rows."""
+    header_text = " ".join(fold_text(line.text) for line in lines[:12])
+    if "giao dich" in header_text and (
+        "cuoc" in header_text or "loi" in header_text
+    ):
+        return "alo789"
+    transaction_line_count = sum(
+        bool(TRANSACTION_ID_RE.search(line.text)) for line in lines
+    )
+    if transaction_line_count >= 2 and not any(
+        extract_ticket_id(line.text) for line in lines
+    ):
+        return "alo789"
+    return "sc8882"
+
+
+def parse_alo789_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
+    """Parse the Alo789 history layout with time, transaction, bet and profit columns."""
+    time_anchors = [
+        (line, match.group(1))
+        for line in lines
+        for match in TIME_RE.finditer(line.text)
+    ]
+    if not time_anchors:
+        return []
+
+    time_anchors.sort(key=lambda item: item[0].y_center)
+    all_text = " ".join(line.text for line in lines)
+    year_match = re.search(r"\b(20\d{2})\b", all_text)
+    year = year_match.group(1) if year_match else str(DateTime.now().year)
+    records: list[dict[str, Any]] = []
+
+    for index, (time_line, time_value) in enumerate(time_anchors):
+        next_time_y = (
+            time_anchors[index + 1][0].y_center
+            if index + 1 < len(time_anchors)
+            else min(1.0, time_line.y_center + 0.10)
+        )
+        row_lines = [
+            line
+            for line in lines
+            if time_line.y_center - 0.015 <= line.y_center < next_time_y - 0.012
+        ]
+        row_words = [word for line in row_lines for word in line.words]
+        row_text = " ".join(line.text for line in row_lines)
+
+        short_date_match = SHORT_DATE_RE.search(row_text)
+        if short_date_match:
+            month, day = (int(value) for value in short_date_match.groups())
+            date_time = f"{year}-{month:02d}-{day:02d} {time_value}"
+        else:
+            date_time = time_value
+
+        transaction_ids: list[tuple[float, float, str]] = []
+        bet_values: list[tuple[float, float]] = []
+        profit_values: list[tuple[float, float]] = []
+        for word in row_words:
+            for match in TRANSACTION_ID_RE.finditer(word.text):
+                transaction_ids.append((word.y_center, word.x_center, match.group(1)))
+            for value in extract_money(word.text):
+                if word.x_center >= 0.72:
+                    profit_values.append((word.y_center, value))
+                elif word.x_center >= 0.40:
+                    bet_values.append((word.y_center, value))
+
+        transaction_ids.sort(key=lambda item: (item[0], item[1]))
+        transaction_values: list[str] = []
+        for _, _, transaction_id in transaction_ids:
+            if transaction_id not in transaction_values:
+                transaction_values.append(transaction_id)
+        bet_values.sort(key=lambda item: item[0])
+        profit_values.sort(key=lambda item: item[0])
+
+        confidence = (
+            sum(line.confidence for line in row_lines) / len(row_lines)
+            if row_lines
+            else 0.0
+        )
+        record = {
+            "source_type": "alo789",
+            "datetime": date_time,
+            "game": "",
+            "bet_amount": bet_values[0][1] if bet_values else None,
+            "valid_bet": None,
+            "net_result": profit_values[0][1] if profit_values else None,
+            "ticket_id": " / ".join(transaction_values),
+            "status": "",
+            "needs_review": False,
+            "ocr_confidence": round(confidence, 3),
+        }
+        record["needs_review"] = any(
+            [
+                not record["datetime"],
+                not record["ticket_id"],
+                record["bet_amount"] is None,
+                record["net_result"] is None,
+                confidence < 0.70,
+            ]
+        )
+        records.append(record)
+
+    return records
+
+
+def parse_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
+    source_type = detect_source_type(lines)
+    if source_type == "alo789":
+        return parse_alo789_records(lines)
+    return parse_sc8882_records(lines)
+
+
 def run_ocr(image: Image.Image) -> tuple[list[OCRLine], list[dict[str, Any]]]:
     lines = parse_ocr_lines(image)
     return lines, parse_records(lines)
@@ -279,6 +396,7 @@ def initialize_database() -> None:
                 batch_id TEXT NOT NULL,
                 saved_at TEXT NOT NULL,
                 source_image TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'sc8882',
                 datetime TEXT,
                 game TEXT NOT NULL DEFAULT '',
                 bet_amount REAL,
@@ -291,6 +409,14 @@ def initialize_database() -> None:
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(saved_records)")
+        }
+        if "source_type" not in columns:
+            connection.execute(
+                "ALTER TABLE saved_records ADD COLUMN source_type TEXT NOT NULL DEFAULT 'sc8882'"
+            )
         connection.commit()
     finally:
         connection.close()
@@ -304,6 +430,7 @@ def load_saved_records() -> list[dict[str, Any]]:
         ).fetchall()
         records = [dict(row) for row in rows]
         for record in records:
+            record.setdefault("source_type", "sc8882")
             record["needs_review"] = bool(record["needs_review"])
         return records
     finally:
@@ -312,10 +439,11 @@ def load_saved_records() -> list[dict[str, Any]]:
 
 def duplicate_key(record: dict[str, Any]) -> tuple[Any, ...] | None:
     """Build a stable duplicate key, preferring the ticket ID from the source."""
+    source_type = fold_text(str(record.get("source_type") or "sc8882")) or "sc8882"
     ticket_id = re.sub(r"\s+", "", str(record.get("ticket_id") or ""))
     if ticket_id:
         digits = re.sub(r"\D", "", ticket_id)
-        return ("ticket_id", digits or ticket_id.casefold())
+        return ("ticket_id", source_type, digits or ticket_id.casefold())
 
     # If OCR missed the ticket ID, only use a conservative fingerprint when
     # enough other fields are present to avoid collapsing incomplete rows.
@@ -332,7 +460,7 @@ def duplicate_key(record: dict[str, Any]) -> tuple[Any, ...] | None:
          amounts[2] is not None, bool(status)]
     )
     if date_time and populated_fields >= 3:
-        return ("record", date_time, game, *amounts, status)
+        return ("record", source_type, date_time, game, *amounts, status)
     return None
 
 
@@ -343,7 +471,7 @@ def save_ocr_batch(
     try:
         existing_rows = connection.execute(
             """
-            SELECT datetime, game, bet_amount, valid_bet, net_result, ticket_id, status
+            SELECT source_type, datetime, game, bet_amount, valid_bet, net_result, ticket_id, status
             FROM saved_records
             """
         ).fetchall()
@@ -369,16 +497,17 @@ def save_ocr_batch(
                 connection.executemany(
                     """
                     INSERT INTO saved_records (
-                        batch_id, saved_at, source_image, datetime, game,
+                        batch_id, saved_at, source_image, source_type, datetime, game,
                         bet_amount, valid_bet, net_result, ticket_id, status,
                         needs_review, ocr_confidence
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
                             batch_id,
                             saved_at,
                             record.get("source_image", ""),
+                            record.get("source_type", "sc8882"),
                             record.get("datetime"),
                             record.get("game", ""),
                             record.get("bet_amount"),
@@ -427,6 +556,7 @@ def save_edited_records(frame: pd.DataFrame) -> None:
                     nullable_text("batch_id", "manual") or "manual",
                     nullable_text("saved_at", now) or now,
                     nullable_text("source_image", "Nhập thủ công") or "Nhập thủ công",
+                    nullable_text("source_type", "sc8882") or "sc8882",
                     nullable_text("datetime") or None,
                     nullable_text("game"),
                     nullable_number("bet_amount"),
@@ -444,10 +574,10 @@ def save_edited_records(frame: pd.DataFrame) -> None:
                     cursor = connection.execute(
                         """
                         INSERT INTO saved_records (
-                            batch_id, saved_at, source_image, datetime, game,
+                            batch_id, saved_at, source_image, source_type, datetime, game,
                             bet_amount, valid_bet, net_result, ticket_id, status,
                             needs_review, ocr_confidence
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values,
                     )
@@ -456,7 +586,7 @@ def save_edited_records(frame: pd.DataFrame) -> None:
                     connection.execute(
                         """
                         UPDATE saved_records SET
-                            batch_id=?, saved_at=?, source_image=?, datetime=?, game=?,
+                            batch_id=?, saved_at=?, source_image=?, source_type=?, datetime=?, game=?,
                             bet_amount=?, valid_bet=?, net_result=?, ticket_id=?, status=?,
                             needs_review=?, ocr_confidence=?
                         WHERE record_id=?
@@ -674,6 +804,7 @@ if records:
             "batch_id": None,
             "saved_at": st.column_config.TextColumn("Lưu lúc", disabled=True),
             "source_image": st.column_config.TextColumn("Ảnh nguồn", disabled=True),
+            "source_type": st.column_config.TextColumn("Phân loại", disabled=True),
             "datetime": st.column_config.TextColumn("Thời gian"),
             "game": st.column_config.TextColumn("Trò chơi"),
             "bet_amount": st.column_config.NumberColumn("Tiền cược", format="%.2f"),

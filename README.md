@@ -1,6 +1,8 @@
 # Đọc danh sách lượt từ ảnh
 
-Ứng dụng Streamlit chạy OCR cục bộ bằng Tesseract. Source code có thể đưa lên GitHub; Docker image được build trực tiếp trên máy chạy ứng dụng và không cần push lên Docker Hub hoặc GitHub Container Registry.
+Ứng dụng Streamlit chạy OCR cục bộ bằng Tesseract. Bộ nhận diện tự phân loại hai layout lịch sử cược: `sc8882` và `alo789`. Source code có thể đưa lên GitHub; Docker image được build trực tiếp trên máy chạy ứng dụng và không cần push lên Docker Hub hoặc GitHub Container Registry.
+
+Với ảnh `alo789`, ứng dụng ánh xạ cột **Cược** vào `bet_amount`, cột **Lời** vào `net_result`, ghép các mã trong cột **Giao Dịch** vào `ticket_id`, và lưu `source_type=alo789`. Vì layout này không có cột cược hợp lệ/trạng thái thanh toán, hai trường đó được để trống.
 
 ## Chạy trên VPS bằng Docker Compose
 

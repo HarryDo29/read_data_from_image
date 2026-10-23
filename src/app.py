@@ -35,12 +35,13 @@ class OCRLine:
 
 
 TIME_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}:\d{2})(?!\d)")
+COMPACT_TIME_RE = re.compile(r"(?<!\d)(\d{2})([0-5]\d)([0-5]\d)(?!\d)")
 DATE_RE = re.compile(r"(?<!\d)(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4})(?!\d)")
 ID_RE = re.compile(r"(?<!\d)((?:\d[ \t]*){15,22})(?!\d)")
 SHORT_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})(?!\d)")
 TRANSACTION_ID_RE = re.compile(r"(?<!\d)(\d{8,14})(?!\d)")
 MONEY_RE = re.compile(
-    r"(?<![\d:])(-?\s*(?:[$€₫]\s*)?(?:\d+)?[.,]\d{1,4})(?!\d)"
+    r"(?<![\d:])(-?\s*(?:[$€₫#]\s*)?(?:\d+)?[.,]\d{1,4})(?!\d)"
 )
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DATABASE_PATH = DATA_DIR / "records.sqlite3"
@@ -55,12 +56,12 @@ def fold_text(value: str) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char)).replace("đ", "d")
 
 
-def parse_ocr_lines(image: Image.Image) -> list[OCRLine]:
+def parse_ocr_lines(image: Image.Image, psm: int = 6) -> list[OCRLine]:
     """Run local Tesseract OCR and preserve token positions for row parsing."""
     data = pytesseract.image_to_data(
         image,
         lang="vie+eng",
-        config="--oem 3 --psm 6",
+        config=f"--oem 3 --psm {psm}",
         output_type=Output.DICT,
     )
     width, height = image.size
@@ -132,6 +133,66 @@ def extract_money(text: str) -> list[float]:
             values.append(float(normalized))
         except ValueError:
             continue
+    return values
+
+
+def extract_alo_time_anchors(
+    lines: list[OCRLine],
+) -> list[tuple[OCRLine, str]]:
+    anchors: list[tuple[OCRLine, str]] = []
+    for line in lines:
+        colon_matches = list(TIME_RE.finditer(line.text))
+        if colon_matches:
+            anchors.extend((line, match.group(1)) for match in colon_matches)
+            continue
+
+        for match in COMPACT_TIME_RE.finditer(line.text):
+            hour = int(match.group(1))
+            # Tesseract sometimes reads the leading 1 in 19:xx:xx as 4.
+            if 40 <= hour <= 49:
+                hour -= 30
+            if hour <= 23:
+                anchors.append(
+                    (line, f"{hour:02d}:{match.group(2)}:{match.group(3)}")
+                )
+    return anchors
+
+
+def repair_alo_amount(text: str, value: float | None = None) -> float | None:
+    """Repair common OCR of the dollar sign as a leading 3 or 4."""
+    sign = -1 if "-" in text else 1
+    digits = re.sub(r"\D", "", text)
+    if not digits:
+        return value
+
+    # In the reference image `$10.00` is often read as `410.00`, and
+    # `$2.50` as `3250`. Remove the false currency character before placing
+    # the decimal point back before the last two digits.
+    if "$" not in text and digits[0] in "34" and len(digits) >= 4:
+        digits = digits[1:]
+        repaired = float(f"{digits[:-2]}.{digits[-2:]}")
+        return sign * repaired
+    return value
+
+
+def extract_alo_money_values(words: list[OCRWord]) -> list[tuple[float, float]]:
+    """Read one or more amount tokens that share an Alo789 column."""
+    ordered_words = sorted(words, key=lambda word: (word.y_center, word.x_center))
+    groups: list[list[OCRWord]] = []
+    for word in ordered_words:
+        if not groups or abs(word.y_center - groups[-1][-1].y_center) > 0.018:
+            groups.append([word])
+        else:
+            groups[-1].append(word)
+
+    values: list[tuple[float, float]] = []
+    for group in groups:
+        text = " ".join(word.text for word in group)
+        parsed_values = extract_money(text)
+        parsed = parsed_values[0] if parsed_values else None
+        repaired = repair_alo_amount(text, parsed)
+        if repaired is not None:
+            values.append((min(word.y_center for word in group), repaired))
     return values
 
 
@@ -269,9 +330,14 @@ def detect_source_type(lines: list[OCRLine]) -> str:
         "cuoc" in header_text or "loi" in header_text
     ):
         return "alo789"
+    compact_time_count = sum(
+        bool(COMPACT_TIME_RE.search(line.text)) for line in lines
+    )
     transaction_line_count = sum(
         bool(TRANSACTION_ID_RE.search(line.text)) for line in lines
     )
+    if compact_time_count >= 2 and transaction_line_count >= 2:
+        return "alo789"
     if transaction_line_count >= 2 and not any(
         extract_ticket_id(line.text) for line in lines
     ):
@@ -281,11 +347,7 @@ def detect_source_type(lines: list[OCRLine]) -> str:
 
 def parse_alo789_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
     """Parse the Alo789 history layout with time, transaction, bet and profit columns."""
-    time_anchors = [
-        (line, match.group(1))
-        for line in lines
-        for match in TIME_RE.finditer(line.text)
-    ]
+    time_anchors = extract_alo_time_anchors(lines)
     if not time_anchors:
         return []
 
@@ -317,24 +379,23 @@ def parse_alo789_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
             date_time = time_value
 
         transaction_ids: list[tuple[float, float, str]] = []
-        bet_values: list[tuple[float, float]] = []
-        profit_values: list[tuple[float, float]] = []
+        bet_words: list[OCRWord] = []
+        profit_words: list[OCRWord] = []
         for word in row_words:
             for match in TRANSACTION_ID_RE.finditer(word.text):
                 transaction_ids.append((word.y_center, word.x_center, match.group(1)))
-            for value in extract_money(word.text):
-                if word.x_center >= 0.72:
-                    profit_values.append((word.y_center, value))
-                elif word.x_center >= 0.40:
-                    bet_values.append((word.y_center, value))
+            if word.x_center >= 0.72:
+                profit_words.append(word)
+            elif word.x_center >= 0.40:
+                bet_words.append(word)
 
         transaction_ids.sort(key=lambda item: (item[0], item[1]))
         transaction_values: list[str] = []
         for _, _, transaction_id in transaction_ids:
             if transaction_id not in transaction_values:
                 transaction_values.append(transaction_id)
-        bet_values.sort(key=lambda item: item[0])
-        profit_values.sort(key=lambda item: item[0])
+        bet_values = extract_alo_money_values(bet_words)
+        profit_values = extract_alo_money_values(profit_words)
 
         confidence = (
             sum(line.confidence for line in row_lines) / len(row_lines)
@@ -375,7 +436,11 @@ def parse_records(lines: list[OCRLine]) -> list[dict[str, Any]]:
 
 
 def run_ocr(image: Image.Image) -> tuple[list[OCRLine], list[dict[str, Any]]]:
-    lines = parse_ocr_lines(image)
+    lines = parse_ocr_lines(image, psm=6)
+    if detect_source_type(lines) == "alo789":
+        # Sparse text mode separates the Alo789 columns more reliably on the
+        # dark mobile screenshot, especially for the time and amount columns.
+        lines = parse_ocr_lines(image, psm=11)
     return lines, parse_records(lines)
 
 

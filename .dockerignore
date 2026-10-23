@@ -1,6 +1,12 @@
 .git
+.gitignore
+.dockerignore
+.env
 .venv
-data
+venv
 __pycache__
 *.py[cod]
+data
+*.sqlite3
+*.log
 .DS_Store

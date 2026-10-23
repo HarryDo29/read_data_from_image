@@ -1,5 +1,12 @@
+.env
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+*.sqlite3
+*.log
 .DS_Store
-data/
+
+# Keep the data directory available after cloning without committing the database.
+data/*
+!data/.gitkeep

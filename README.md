@@ -1,22 +1,111 @@
 # Đọc danh sách lượt từ ảnh
 
-Bản thử dành cho máy tính Windows, chạy trong Docker Desktop. Giao diện mở trong trình duyệt tại `http://localhost:8501`; ảnh được OCR trong container cục bộ.
+Ứng dụng Streamlit chạy OCR cục bộ bằng Tesseract. Source code có thể đưa lên GitHub; Docker image được build trực tiếp trên máy chạy ứng dụng và không cần push lên Docker Hub hoặc GitHub Container Registry.
+
+## Chạy trên VPS bằng Docker Compose
+
+VPS cần có Git, Docker và Docker Compose plugin.
+
+```bash
+cd /opt
+git clone git@github.com:USERNAME/REPOSITORY.git bet-image-reader
+cd bet-image-reader
+
+cp .env.example .env
+mkdir -p data
+docker compose up -d --build
+```
+
+Kiểm tra container:
+
+```bash
+docker compose ps
+docker compose logs -f bet-image-reader
+```
+
+Khi cập nhật source code:
+
+```bash
+cd /opt/bet-image-reader
+git pull
+docker compose up -d --build --remove-orphans
+```
+
+Dừng ứng dụng:
+
+```bash
+docker compose down
+```
+
+Image local có tên `bet-image-reader:local`. Nó chỉ tồn tại trong Docker của VPS và không được đẩy lên registry.
+
+## Cấu hình truy cập từ Internet
+
+Mặc định `.env.example` dùng:
+
+```dotenv
+APP_BIND_ADDRESS=127.0.0.1
+APP_PORT=8501
+DATA_DIR=./data
+```
+
+Giữ `127.0.0.1` nếu dùng Nginx hoặc Caddy làm reverse proxy. Nếu muốn truy cập trực tiếp bằng IP VPS, đặt trong file `.env`:
+
+```dotenv
+APP_BIND_ADDRESS=0.0.0.0
+APP_PORT=8501
+```
+
+Ứng dụng hiện chưa có đăng nhập, vì vậy nên dùng reverse proxy, HTTPS và cơ chế bảo vệ truy cập trước khi mở ra Internet.
+
+## Chạy qua Portainer
+
+### Portainer Docker Standalone
+
+Build image trên VPS trước:
+
+```bash
+cd /opt/bet-image-reader
+docker build -t bet-image-reader:local .
+```
+
+Trong Portainer chọn **Stacks → Add stack → Web editor**, rồi dùng nội dung `docker-compose.portainer.yml`. Portainer phải quản lý đúng Docker Environment của VPS để nhìn thấy image local.
+
+Không chạy thêm `docker compose up` cho cùng stack nếu đã deploy stack đó từ Portainer.
+
+### Portainer Docker Swarm
+
+Build image trên VPS:
+
+```bash
+cd /opt/bet-image-reader
+docker build -t bet-image-reader:local .
+```
+
+Trong Portainer tạo Stack bằng file `docker-stack.yml`. Nếu dữ liệu cần nằm ở đường dẫn cụ thể trên VPS, đặt biến stack:
+
+```dotenv
+DATA_DIR=/opt/bet-image-reader/data
+```
+
+File Stack giữ một replica vì database SQLite không phù hợp để nhiều container ghi đồng thời. Nếu Swarm có nhiều node, image local phải tồn tại trên node được chọn; với một VPS duy nhất thì không có vấn đề này.
 
 ## Chạy trên Windows
 
 1. Cài và khởi động Docker Desktop.
-2. Giải nén gói dự án vào một thư mục.
-3. Nhấp đúp `start.bat`. Lần đầu Docker sẽ tải các thành phần cần thiết và dựng ứng dụng; bước này có thể mất vài phút.
-4. Trình duyệt mở tại <http://localhost:8501>.
-5. Tải lên một ảnh dài hoặc chọn nhiều ảnh cùng lúc, rồi bấm **Đọc và lưu vào danh sách**.
-6. Các lượt mới được nối vào danh sách đã lưu; lượt trùng sẽ tự được bỏ qua. Kiểm tra/sửa bảng, đánh dấu cột **Chọn xóa** rồi bấm **Xóa dòng đã chọn** để xóa lượt không đúng. Bấm **Xóa hết danh sách đã lưu** rồi xác nhận nếu muốn xóa toàn bộ lượt. Bấm nút lưu để giữ các chỉnh sửa trong bảng, rồi tải CSV.
+2. Nhấp đúp `start.bat`.
+3. Mở <http://localhost:8501>.
+4. Nhấp đúp `stop.bat` để dừng ứng dụng.
 
-Đóng ứng dụng bằng cách nhấp đúp `stop.bat`. Dữ liệu đã lưu trong `data/records.sqlite3` vẫn được giữ lại. Có thể chạy thủ công bằng PowerShell với `docker compose up --build -d`, rồi dừng bằng `docker compose down`.
+Database được lưu trong `data/records.sqlite3` và vẫn còn sau khi container dừng hoặc được tạo lại. Thư mục `data` và file `.env` không được commit lên GitHub.
 
-Mỗi dòng có cột **Ảnh nguồn** và **Lưu lúc** để đối chiếu. Ứng dụng bỏ qua lượt có ID vé đã lưu hoặc bị lặp trong ảnh đang đọc. Nếu sửa bảng, bấm lưu để giữ thay đổi. Nút xóa áp dụng ngay; hãy lưu các chỉnh sửa khác trước nếu muốn giữ chúng. CSV dùng dấu chấm phẩy để chia cột và dấu phẩy cho số thập phân, phù hợp khi mở bằng Excel theo thiết lập vùng Việt Nam.
+## Sao lưu dữ liệu
 
-Docker image cài sẵn Tesseract cùng gói ngôn ngữ tiếng Việt và tiếng Anh. Trên Windows không cần cài Python hay Tesseract riêng. Nếu sửa mã nguồn, chạy lại `docker compose up --build` để tạo image mới.
+Trên VPS, sao lưu file database:
 
-Kết quả OCR được lưu cục bộ trong `data/records.sqlite3` trên máy và giữ lại sau khi dừng/khởi động lại Docker. Xóa ảnh khỏi vùng tải lên chỉ xóa lựa chọn ảnh, không xóa danh sách đã lưu. Ảnh gốc không được lưu. Có thể sao lưu file cơ sở dữ liệu này để giữ dữ liệu.
+```bash
+cp /opt/bet-image-reader/data/records.sqlite3 \
+   /opt/bet-image-reader/data/records.sqlite3.backup
+```
 
-Đây là bản thử cho bố cục ảnh giống ảnh mẫu. OCR có thể nhầm ID vé hoặc số tiền, vì vậy hãy đối chiếu những dòng có nhãn **Cần kiểm tra?** trước khi dùng thống kê.
+Ảnh gốc không được lưu trong ứng dụng. OCR có thể nhầm ID vé hoặc số tiền, nên cần kiểm tra những dòng được đánh dấu **Cần kiểm tra?**.
